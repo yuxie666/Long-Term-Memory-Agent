@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.env
+.locomo_cache/
+memory_agent/experiments/results/*.json
+memory_agent/experiments/results/traces/
+memory_agent/experiments/results/test_traces/
