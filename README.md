@@ -5,6 +5,8 @@ This project implements the required `ingest(conversation)` / `answer(question)`
 ## Structure
 
 ```text
+README.md
+Agent_Memory.md
 memory_agent/
   memory/
     store.py       # derived memory records and vector index
@@ -16,6 +18,10 @@ memory_agent/
   eval/
     run_eval.py    # convenience runner
 memory_agent/experiments/results/
+eval_kit/
+  prepare_eval_set.py
+  run_generation.py
+  run_judge.py
 ```
 
 The implementation explicitly separates raw dialogue logs from derived memory units. Raw turns are kept only for traceability; retrieval uses `MemoryRecord` objects such as `speaker said on date: fact`.
@@ -23,7 +29,7 @@ The implementation explicitly separates raw dialogue logs from derived memory un
 ## Setup
 
 ```bash
-pip install -r memory_agent/requirements.txt
+pip install -r requirements.txt
 ```
 
 Start an OpenAI-compatible generation server, for example:
