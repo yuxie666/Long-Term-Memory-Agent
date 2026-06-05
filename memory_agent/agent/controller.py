@@ -23,12 +23,12 @@ class MemoryAgent:
 
     def __init__(self, top_k: int | None = None, log_dir: str | None = None):
         self.llm = LLMClient()
-        self.writer = MemoryWriter()
+        self.writer = MemoryWriter(reflection_llm=lambda prompt: self.llm.generate(prompt, max_tokens=512))
         self.store = MemoryStore(auto_load=os.getenv("MEMORY_AUTO_LOAD", "0").lower() in {"1", "true", "yes"})
         self.updater = MemoryUpdater()
         self.retriever = MemoryRetriever(
             self.store,
-            top_k=top_k or int(os.getenv("MEMORY_TOP_K", "8")),
+            top_k=top_k or int(os.getenv("MEMORY_TOP_K", "16")),
             strategy=os.getenv("MEMORY_RETRIEVAL_STRATEGY", "hybrid"),
             recency_weight=float(os.getenv("MEMORY_RECENCY_WEIGHT", "0.15")),
             importance_weight=float(os.getenv("MEMORY_IMPORTANCE_WEIGHT", "0.2")),
@@ -44,6 +44,7 @@ class MemoryAgent:
         self.log_dir = Path(log_dir or os.getenv("MEMORY_LOG_DIR", str(default_log_dir)))
         self.trace_id = f"trace_{int(time.time() * 1000)}_{id(self)}"
         self.ingest_stats: dict = {}
+        self.answer_max_tokens = int(os.getenv("MEMORY_ANSWER_MAX_TOKENS", "512"))
 
     def ingest(self, conversation: dict) -> None:
         low_records, high_records, raw_log = self.writer.extract(conversation)
@@ -62,30 +63,42 @@ class MemoryAgent:
             "high_update_stats": high_stats,
             "index_dir": str(self.store.persist_dir),
         }
-        self._append_trace({"event": "ingest", **self.ingest_stats})
+        self._append_trace(
+            {
+                "event": "ingest",
+                **self.ingest_stats,
+                "raw_log": raw_log,
+                "extracted_low_memories": [record.to_dict() for record in low_records],
+                "extracted_high_memories": [record.to_dict() for record in high_records],
+                "stored_memories_snapshot": [record.to_dict() for record in self.store.records],
+            }
+        )
 
     def answer(self, question: str) -> str:
         retrieved = self.retriever.retrieve(question)
-        memory_text = "\n".join(
-            (
-                f"- [{record.memory_level.upper()}] {record.text} "
-                f"(source: session {record.session_id}, {record.date_time}; score={scores['score']})"
-            )
-            for record, scores in retrieved
-        )
+        memory_text = "\n".join(self._format_memory_for_prompt(record, scores) for record, scores in retrieved)
         if not memory_text:
             memory_text = "No relevant memory found."
 
         prompt = (
             "You are an assistant with long-term memory from a past conversation. "
-            "The memory list contains high-level session summaries and low-level raw dialogue turns. "
-            "Answer the question using only the memories. Keep the answer short "
-            "(a phrase or one sentence). If the memories do not contain the answer, reply 'unknown'.\n\n"
+            "The memory list contains derived memory records, not raw dialogue. "
+            "LOW memories are atomic facts or events extracted from dialogue. "
+            "HIGH memories are reflective summaries generated from LOW memories and may include supporting evidence. "
+            "Use active memories as current facts; superseded memories are historical only. "
+            "Answer using only the memories. Keep the answer short "
+            "(a phrase or one sentence). For list questions, combine all relevant retrieved facts. "
+            "If multiple memories each contain part of the answer, synthesize them into one answer. "
+            "For comparison or option questions, choose the option best supported by the memories. "
+            "You may use general world knowledge only to map answer options to categories explicitly present "
+            "in the memories, such as matching a car model to a classic/muscle/SUV category. "
+            "For relationship questions, a cautious evidence-based description is allowed. "
+            "If the memories truly do not contain enough evidence, reply 'unknown'.\n\n"
             f"=== Retrieved memories ===\n{memory_text}\n\n"
             f"=== Question ===\n{question}\n\n"
             "=== Answer ==="
         )
-        answer = self.llm.generate(prompt, max_tokens=64).strip()
+        answer = self.llm.generate(prompt, max_tokens=self.answer_max_tokens).strip()
         self._append_trace(
             {
                 "event": "answer",
@@ -100,6 +113,38 @@ class MemoryAgent:
         )
         return answer
 
+    def _format_memory_for_prompt(self, record, scores: dict) -> str:
+        status = record.metadata.get("status", "active")
+        memory_type = record.metadata.get("memory_type", record.predicate)
+        event_date = record.metadata.get("event_date")
+        parts = [
+            f"- [{record.memory_level.upper()} {memory_type}; status={status}] {record.text}",
+            f"  source: session {record.session_id}, {record.date_time}; score={scores['score']}",
+        ]
+        if event_date:
+            parts.append(f"  normalized_event_date: {event_date}")
+        if record.memory_level == "high":
+            evidence = self._supporting_low_memories(record)
+            if evidence:
+                parts.append("  supporting_low_memories:")
+                parts.extend(f"    * {item}" for item in evidence)
+        return "\n".join(parts)
+
+    def _supporting_low_memories(self, record) -> list[str]:
+        source_ids = set(record.metadata.get("source_memory_ids", []))
+        if not source_ids:
+            return []
+        supporting = []
+        for candidate in self.store.records:
+            if candidate.id in source_ids:
+                status = candidate.metadata.get("status", "active")
+                if status == "superseded":
+                    continue
+                supporting.append(f"[status={status}] {candidate.text}")
+            if len(supporting) >= 4:
+                break
+        return supporting
+
     def _append_trace(self, payload: dict) -> None:
         try:
             self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -113,6 +158,7 @@ class MemoryAgent:
 class NoMemoryAgent:
     def __init__(self):
         self.llm = LLMClient()
+        self.answer_max_tokens = int(os.getenv("MEMORY_ANSWER_MAX_TOKENS", "512"))
 
     def ingest(self, conversation: dict) -> None:
         return None
@@ -122,7 +168,7 @@ class NoMemoryAgent:
             "Answer the question briefly. If the answer cannot be inferred, reply 'unknown'.\n\n"
             f"Question: {question}\nAnswer:"
         )
-        return self.llm.generate(prompt, max_tokens=64).strip()
+        return self.llm.generate(prompt, max_tokens=self.answer_max_tokens).strip()
 
 
 class FullContextAgent:
@@ -130,6 +176,7 @@ class FullContextAgent:
         self.llm = LLMClient()
         self.max_turns = max_turns
         self.history_text = ""
+        self.answer_max_tokens = int(os.getenv("MEMORY_ANSWER_MAX_TOKENS", "512"))
 
     def ingest(self, conversation: dict) -> None:
         lines = []
@@ -150,7 +197,7 @@ class FullContextAgent:
             f"=== Question ===\n{question}\n\n"
             "=== Answer ==="
         )
-        return self.llm.generate(prompt, max_tokens=64).strip()
+        return self.llm.generate(prompt, max_tokens=self.answer_max_tokens).strip()
 
 
 class VanillaRAGAgent:

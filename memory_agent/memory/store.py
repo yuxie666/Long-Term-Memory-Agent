@@ -188,16 +188,32 @@ class MemoryStore:
 
     def lexical_overlap(self, query: str, record: MemoryRecord) -> float:
         q_terms = self._terms(query)
-        r_terms = self._terms(record.text)
+        record_context = " ".join(
+            str(part)
+            for part in (
+                record.subject,
+                record.predicate,
+                record.object,
+                record.text,
+                record.metadata.get("memory_type", ""),
+            )
+            if part
+        )
+        r_terms = self._terms(record_context)
         if not q_terms or not r_terms:
             return 0.0
         return len(q_terms & r_terms) / math.sqrt(len(q_terms) * len(r_terms))
 
     def _terms(self, text: str) -> set[str]:
         raw_terms = re.findall(r"[A-Za-z0-9_']+", text.lower())
-        stop = {"the", "a", "an", "and", "or", "to", "of", "in", "on", "is", "was", "are", "did"}
+        stop = {
+            "the", "a", "an", "and", "or", "to", "of", "in", "on", "is", "was", "are", "did",
+            "what", "who", "when", "where", "which", "how", "kind", "with", "for", "has", "had", "have",
+        }
         terms = set()
         for term in raw_terms:
+            if term.endswith("'s") and len(term) > 3:
+                term = term[:-2]
             if term in stop or len(term) <= 2:
                 continue
             if term.endswith("ing") and len(term) > 5:

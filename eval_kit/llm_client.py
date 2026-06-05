@@ -14,6 +14,7 @@
 
 import os
 import time
+from pathlib import Path
 from typing import Optional
 
 try:
@@ -31,6 +32,7 @@ class LLMClient:
         temperature: float = 0.0,
         max_retries: int = 3,
     ):
+        _load_dotenv_if_present()
         # 优先使用显式传入的参数，其次用环境变量，最后用默认值
         self.base_url = base_url or os.getenv("LLM_BASE_URL", "http://localhost:8000/v1")
         self.api_key = api_key or os.getenv("LLM_API_KEY", "EMPTY")
@@ -74,3 +76,21 @@ class LLMClient:
             texts = [texts]
         resp = self.client.embeddings.create(model=model, input=texts)
         return [item.embedding for item in resp.data]
+
+
+def _load_dotenv_if_present() -> None:
+    """Load simple KEY=VALUE lines from the project .env file without extra dependencies."""
+    root = Path(__file__).resolve().parents[1]
+    env_path = root / ".env"
+    if not env_path.exists():
+        return
+    with env_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value

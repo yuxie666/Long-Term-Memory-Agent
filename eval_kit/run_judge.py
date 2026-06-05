@@ -116,7 +116,8 @@ def judge_one(client: LLMClient, pred_entry: dict) -> dict:
         reference=pred_entry["reference"],
         prediction=pred_entry["prediction"],
     )
-    raw = client.generate(prompt, max_tokens=128, system=JUDGE_SYSTEM, temperature=0.0)
+    judge_max_tokens = int(os.getenv("JUDGE_MAX_TOKENS", "512"))
+    raw = client.generate(prompt, max_tokens=judge_max_tokens, system=JUDGE_SYSTEM, temperature=0.0)
     parsed = parse_judge_output(raw)
     return {
         **pred_entry,
