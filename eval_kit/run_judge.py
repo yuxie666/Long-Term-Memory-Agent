@@ -150,7 +150,7 @@ def main():
     if args.judge_model:
         os.environ["LLM_MODEL"] = args.judge_model
 
-    with open(args.predictions) as f:
+    with open(args.predictions, encoding="utf-8") as f:
         preds = json.load(f)
     if args.limit:
         preds = preds[:args.limit]
@@ -221,7 +221,7 @@ def main():
         "predictions_file": args.predictions,
         "graded": graded,
     }
-    with open(args.output, "w") as f:
+    with open(args.output, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
     # ---------- 打印表格 ----------

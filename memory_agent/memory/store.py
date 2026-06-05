@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import re
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 
+_EMBEDDER_CACHE = None
+
+
 @dataclass
 class MemoryRecord:
-    """A derived memory unit, separated from the raw dialogue log."""
+    """A memory unit stored in the local vector index."""
 
     id: str
     subject: str
@@ -22,7 +27,8 @@ class MemoryRecord:
     evidence: list[str]
     session_id: int | str
     date_time: str
-    turn_index: int
+    turn_index: int | None
+    memory_level: str = "high"
     importance: float = 0.5
     created_at: int = 0
     updated_at: int = 0
@@ -57,43 +63,68 @@ class HashingEmbedder:
 
 
 def load_embedder():
+    global _EMBEDDER_CACHE
+    if _EMBEDDER_CACHE is not None:
+        return _EMBEDDER_CACHE
+
     model_name = os.getenv("EMBED_MODEL", "BAAI/bge-small-zh-v1.5")
     local_only = os.getenv("EMBED_LOCAL_ONLY", "1").lower() not in {"0", "false", "no"}
     try:
         from sentence_transformers import SentenceTransformer
 
         try:
-            return SentenceTransformer(model_name, local_files_only=local_only)
+            _EMBEDDER_CACHE = SentenceTransformer(model_name, local_files_only=local_only)
         except TypeError:
-            return SentenceTransformer(model_name)
+            _EMBEDDER_CACHE = SentenceTransformer(model_name)
     except Exception:
-        return HashingEmbedder()
+        _EMBEDDER_CACHE = HashingEmbedder()
+    return _EMBEDDER_CACHE
 
 
 class MemoryStore:
-    """In-memory vector index for derived memory records."""
+    """Local persistent vector index for low-level and high-level memories."""
 
-    def __init__(self, embedder=None):
+    def __init__(self, embedder=None, persist_dir: str | Path | None = None, auto_load: bool = False):
         self.embedder = embedder or load_embedder()
         self.records: list[MemoryRecord] = []
         self.embeddings: np.ndarray | None = None
+        default_dir = Path(__file__).resolve().parents[1] / "experiments" / "memory_index"
+        self.persist_dir = Path(persist_dir or os.getenv("MEMORY_INDEX_DIR", str(default_dir)))
+        if auto_load:
+            self.load()
 
     def __len__(self) -> int:
         return len(self.records)
 
+    def count(self, memory_level: str | None = None) -> int:
+        if memory_level is None:
+            return len(self.records)
+        return sum(1 for record in self.records if record.memory_level == memory_level)
+
     def add(self, record: MemoryRecord) -> None:
         self.records.append(record)
-        self._rebuild_embeddings()
+        vec = self._encode_records([record])
+        self.embeddings = vec if self.embeddings is None else np.vstack([self.embeddings, vec])
 
     def replace(self, index: int, record: MemoryRecord) -> None:
         self.records[index] = record
-        self._rebuild_embeddings()
+        vec = self._encode_records([record])
+        if self.embeddings is None:
+            self.embeddings = self._encode_records(self.records)
+        else:
+            self.embeddings[index] = vec[0]
 
     def extend(self, records: list[MemoryRecord]) -> None:
         if not records:
             return
         self.records.extend(records)
-        self._rebuild_embeddings()
+        vecs = self._encode_records(records)
+        self.embeddings = vecs if self.embeddings is None else np.vstack([self.embeddings, vecs])
+
+    def _encode_records(self, records: list[MemoryRecord]) -> np.ndarray:
+        texts = [record.text for record in records]
+        vecs = self.embedder.encode(texts, normalize_embeddings=True)
+        return np.atleast_2d(np.array(vecs, dtype=np.float32))
 
     def _rebuild_embeddings(self) -> None:
         if not self.records:
@@ -103,13 +134,57 @@ class MemoryStore:
         vecs = self.embedder.encode(texts, normalize_embeddings=True)
         self.embeddings = np.array(vecs, dtype=np.float32)
 
-    def search(self, query: str, top_k: int = 8) -> list[tuple[MemoryRecord, float]]:
+    def search(
+        self,
+        query: str,
+        top_k: int = 8,
+        memory_level: str | None = None,
+    ) -> list[tuple[MemoryRecord, float]]:
         if self.embeddings is None or not self.records:
             return []
         qvec = self.embedder.encode([query], normalize_embeddings=True)[0]
         sims = self.embeddings @ qvec.astype(np.float32)
-        idx = np.argsort(-sims)[: min(top_k, len(self.records))]
+        allowed = [
+            i for i, record in enumerate(self.records)
+            if memory_level is None or record.memory_level == memory_level
+        ]
+        if not allowed:
+            return []
+        ranked = sorted(allowed, key=lambda i: float(sims[i]), reverse=True)
+        idx = ranked[: min(top_k, len(ranked))]
         return [(self.records[int(i)], float(sims[int(i)])) for i in idx]
+
+    def records_by_level(self, memory_level: str | None = None) -> list[MemoryRecord]:
+        if memory_level is None:
+            return list(self.records)
+        return [record for record in self.records if record.memory_level == memory_level]
+
+    def save(self) -> None:
+        self.persist_dir.mkdir(parents=True, exist_ok=True)
+        records_path = self.persist_dir / "records.json"
+        embeddings_path = self.persist_dir / "embeddings.npy"
+        with records_path.open("w", encoding="utf-8") as f:
+            json.dump([record.to_dict() for record in self.records], f, ensure_ascii=False, indent=2)
+        if self.embeddings is None:
+            np.save(embeddings_path, np.zeros((0, 0), dtype=np.float32))
+        else:
+            np.save(embeddings_path, self.embeddings)
+
+    def load(self) -> None:
+        records_path = self.persist_dir / "records.json"
+        embeddings_path = self.persist_dir / "embeddings.npy"
+        if not records_path.exists():
+            return
+        with records_path.open(encoding="utf-8") as f:
+            raw_records = json.load(f)
+        self.records = [MemoryRecord(**record) for record in raw_records]
+        if embeddings_path.exists():
+            loaded = np.load(embeddings_path)
+            self.embeddings = None if loaded.size == 0 else np.array(loaded, dtype=np.float32)
+        else:
+            self._rebuild_embeddings()
+        if self.embeddings is not None and len(self.embeddings) != len(self.records):
+            self._rebuild_embeddings()
 
     def lexical_overlap(self, query: str, record: MemoryRecord) -> float:
         q_terms = self._terms(query)

@@ -2,7 +2,7 @@
 
 from .store import MemoryRecord, MemoryStore
 from .writer import MemoryWriter
-from .retriever import MemoryRetriever
+from .retriever import MemoryRetriever, RetrievalStrategy
 from .updater import MemoryUpdater
 
 __all__ = [
@@ -11,5 +11,5 @@ __all__ = [
     "MemoryWriter",
     "MemoryRetriever",
     "MemoryUpdater",
+    "RetrievalStrategy",
 ]
-

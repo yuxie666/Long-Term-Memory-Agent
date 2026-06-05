@@ -24,9 +24,21 @@ class MemoryAgent:
     def __init__(self, top_k: int | None = None, log_dir: str | None = None):
         self.llm = LLMClient()
         self.writer = MemoryWriter()
-        self.store = MemoryStore()
+        self.store = MemoryStore(auto_load=os.getenv("MEMORY_AUTO_LOAD", "0").lower() in {"1", "true", "yes"})
         self.updater = MemoryUpdater()
-        self.retriever = MemoryRetriever(self.store, top_k=top_k or int(os.getenv("MEMORY_TOP_K", "8")))
+        self.retriever = MemoryRetriever(
+            self.store,
+            top_k=top_k or int(os.getenv("MEMORY_TOP_K", "8")),
+            strategy=os.getenv("MEMORY_RETRIEVAL_STRATEGY", "hybrid"),
+            recency_weight=float(os.getenv("MEMORY_RECENCY_WEIGHT", "0.15")),
+            importance_weight=float(os.getenv("MEMORY_IMPORTANCE_WEIGHT", "0.2")),
+            relevance_weight=float(os.getenv("MEMORY_RELEVANCE_WEIGHT", "0.65")),
+            vector_weight=float(os.getenv("MEMORY_VECTOR_WEIGHT", "0.7")),
+            factor_weight=float(os.getenv("MEMORY_FACTOR_WEIGHT", "0.3")),
+            vector_threshold=float(os.getenv("MEMORY_VECTOR_THRESHOLD", "0.18")),
+            factor_threshold=float(os.getenv("MEMORY_FACTOR_THRESHOLD", "0.25")),
+            hybrid_threshold=float(os.getenv("MEMORY_HYBRID_THRESHOLD", "0.22")),
+        )
         self.raw_log: list[str] = []
         default_log_dir = ROOT / "memory_agent" / "experiments" / "results" / "traces"
         self.log_dir = Path(log_dir or os.getenv("MEMORY_LOG_DIR", str(default_log_dir)))
@@ -34,21 +46,31 @@ class MemoryAgent:
         self.ingest_stats: dict = {}
 
     def ingest(self, conversation: dict) -> None:
-        records, raw_log = self.writer.extract(conversation)
+        low_records, high_records, raw_log = self.writer.extract(conversation)
         self.raw_log = raw_log
-        stats = self.updater.merge_into_store(self.store, records)
+        low_stats = self.updater.merge_into_store(self.store, low_records)
+        high_stats = self.updater.merge_into_store(self.store, high_records)
+        self.store.save()
         self.ingest_stats = {
             "raw_turns": len(raw_log),
-            "extracted_memories": len(records),
+            "low_memories": len(low_records),
+            "high_memories": len(high_records),
+            "stored_low_memories": self.store.count("low"),
+            "stored_high_memories": self.store.count("high"),
             "stored_memories": len(self.store),
-            "update_stats": stats,
+            "low_update_stats": low_stats,
+            "high_update_stats": high_stats,
+            "index_dir": str(self.store.persist_dir),
         }
         self._append_trace({"event": "ingest", **self.ingest_stats})
 
     def answer(self, question: str) -> str:
         retrieved = self.retriever.retrieve(question)
         memory_text = "\n".join(
-            f"- {record.text} (source: session {record.session_id}, {record.date_time}; score={scores['score']})"
+            (
+                f"- [{record.memory_level.upper()}] {record.text} "
+                f"(source: session {record.session_id}, {record.date_time}; score={scores['score']})"
+            )
             for record, scores in retrieved
         )
         if not memory_text:
@@ -56,7 +78,7 @@ class MemoryAgent:
 
         prompt = (
             "You are an assistant with long-term memory from a past conversation. "
-            "The memory list contains derived facts, not raw dialogue. "
+            "The memory list contains high-level session summaries and low-level raw dialogue turns. "
             "Answer the question using only the memories. Keep the answer short "
             "(a phrase or one sentence). If the memories do not contain the answer, reply 'unknown'.\n\n"
             f"=== Retrieved memories ===\n{memory_text}\n\n"

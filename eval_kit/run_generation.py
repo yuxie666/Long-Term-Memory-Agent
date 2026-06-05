@@ -49,7 +49,7 @@ def main():
                         help="跳过 --output 中已经出现过的 qa_id（断点续跑）")
     args = parser.parse_args()
 
-    with open(args.eval_set) as f:
+    with open(args.eval_set, encoding="utf-8") as f:
         eval_set = json.load(f)
     if args.limit_conversations:
         eval_set = eval_set[:args.limit_conversations]
@@ -59,7 +59,7 @@ def main():
     predictions = []
     out_path = Path(args.output)
     if args.resume and out_path.exists():
-        with open(out_path) as f:
+        with open(out_path, encoding="utf-8") as f:
             predictions = json.load(f)
         done_ids = {p["qa_id"] for p in predictions}
         print(f"[续跑] 已加载 {len(done_ids)} 条现有预测")
@@ -138,7 +138,7 @@ def main():
 
 def _save(path: Path, preds: list):
     """把预测结果落盘。每段对话结束都会调用一次，保证崩溃可恢复。"""
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(preds, f, ensure_ascii=False, indent=2)
 
 

@@ -15,12 +15,26 @@ class MemoryUpdater:
     def merge_into_store(self, store: MemoryStore, records: list[MemoryRecord]) -> dict:
         stats = {"added": 0, "deduplicated": 0, "updated": 0}
         for record in records:
+            if any(existing.id == record.id for existing in store.records):
+                stats["deduplicated"] += 1
+                continue
+            if record.memory_level == "low":
+                store.add(record)
+                stats["added"] += 1
+                continue
             if len(store) == 0:
                 store.add(record)
                 stats["added"] += 1
                 continue
 
-            candidates = store.search(record.text, top_k=5)
+            candidates = [
+                item for item in store.search(record.text, top_k=5, memory_level=record.memory_level)
+                if item[0].memory_level == record.memory_level
+            ]
+            if not candidates:
+                store.add(record)
+                stats["added"] += 1
+                continue
             best, best_score = candidates[0]
             if best_score >= self.duplicate_threshold:
                 stats["deduplicated"] += 1
@@ -48,6 +62,8 @@ class MemoryUpdater:
         for candidate, score in candidates:
             if score < self.conflict_threshold:
                 continue
+            if candidate.memory_level != record.memory_level:
+                continue
             if candidate.subject != record.subject:
                 continue
             old_terms = self._content_terms(candidate.object)
@@ -67,4 +83,3 @@ class MemoryUpdater:
         terms = set(re.findall(r"[A-Za-z0-9_']+", text.lower()))
         stop = {"the", "a", "an", "and", "or", "to", "of", "in", "on", "is", "was", "are", "i", "you"}
         return {term for term in terms if term not in stop and len(term) > 2}
-
