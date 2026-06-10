@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.idea
+.locomo_cache/
+test/
+eval_kit/
+experiments/
+memory_agent/experiments/results/*.json
+memory_agent/experiments/results/traces/
+memory_agent/experiments/results/test_traces/
