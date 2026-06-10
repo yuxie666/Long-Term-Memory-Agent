@@ -5,7 +5,6 @@ __pycache__/
 .idea
 .locomo_cache/
 test/
-eval_kit/
 experiments/
 memory_agent/experiments/results/*.json
 memory_agent/experiments/results/traces/
