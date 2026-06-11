@@ -21,6 +21,8 @@ import os
 import numpy as np
 from llm_client import LLMClient
 
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
 
 class VanillaRAGAgent:
     def __init__(self, top_k: int = 5):

@@ -25,6 +25,8 @@ from collections import Counter
 
 import numpy as np
 
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
 from memory.store import MemoryStore, MemoryUnit
 
 
@@ -102,9 +104,11 @@ class _Reranker:
 class MemoryRetriever:
     def __init__(self, store: MemoryStore, strategy: str = "hybrid",
                  top_k: int = 8, recency_half_life_days: float = 60.0,
-                 hybrid_weights=(1.0, 0.2, 0.2), tf_weights=(1.0, 1.0, 1.0),
-                 per_layer: bool = True, bm25_weight: float = 0.5,
-                 rerank: bool = True, final_k: int = 6, verbose: bool = True):
+                 hybrid_weights=(1.0, 0.1, 0.1), tf_weights=(1.0, 1.0, 1.0),
+                 per_layer: bool = True, bm25_weight: float = 0.8,
+                 rerank: bool = True, final_k: int = 6,
+                 mmr: bool = True, mmr_lambda: float = 0.65, verbose: bool = True,
+                 bm25_as_separate_recall: bool = True):
         assert strategy in ("vector", "three_factor", "hybrid")
         self.store = store
         self.strategy = strategy
@@ -112,11 +116,16 @@ class MemoryRetriever:
         self.per_layer = per_layer      # True：observation / summary 各取 top_k 再合并
         self.rerank = rerank            # 是否用 cross-encoder 精排（宽召回→窄生成）
         self.final_k = final_k          # 精排后最终喂给生成的条数（窄，提升信噪比）
+        # MMR：在精排相关性基础上做多样性选择，避免 top-k 被问题主词的近重复占满
+        # （"besides basketball" 召回 8 条 basketball，把真正答案挤出去）。
+        self.mmr = mmr
+        self.mmr_lambda = mmr_lambda    # λ·相关性 -(1-λ)·与已选项的最大冗余度
         self.half_life = recency_half_life_days
         # hybrid：relevance 权重 1.0，远高于 recency/importance 的 0.2，保证"向量相似度为主"
         self.w_rel, self.w_rec, self.w_imp = hybrid_weights
         self.tf = tf_weights                            # three_factor 三因子权重
         self.bm25_weight = bm25_weight                  # hybrid 下 BM25 关键词分的融合权重
+        self.bm25_as_separate_recall = bm25_as_separate_recall  # 是否将 BM25 作为独立召回路
         self.verbose = verbose
         self._bm25 = None
         self._bm25_n = -1                               # 构建时的库大小，用于失效判断
@@ -138,23 +147,50 @@ class MemoryRetriever:
         if self.strategy == "three_factor":
             return (self.tf[0] * _minmax(sims)
                     + self.tf[1] * recency + self.tf[2] * importance)
-        # hybrid：向量相关性 + BM25 关键词相关性（混合检索）+ 三因子小幅加成。
-        # 向量召回语义近似，BM25 召回 token 精确匹配（书名/车型/专有名词），互补。
-        bm25 = _minmax(self._get_bm25().scores(query))
-        return (self.w_rel * _minmax(sims) + self.bm25_weight * bm25
-                + self.w_rec * recency + self.w_imp * importance)
+        # hybrid：向量相关性 + 三因子小幅加成。
+        # 当 BM25 作为独立召回路径时，不在融合分数中重复计算
+        if self.bm25_as_separate_recall:
+            # BM25 已作为独立召回路径，这里只计算向量相似度 + 时间/重要性
+            return (self.w_rel * _minmax(sims)
+                    + self.w_rec * recency + self.w_imp * importance)
+        else:
+            # BM25 融入分数计算（传统 hybrid）
+            bm25 = _minmax(self._get_bm25().scores(query))
+            return (self.w_rel * _minmax(sims) + self.bm25_weight * bm25
+                    + self.w_rec * recency + self.w_imp * importance)
 
-    def retrieve(self, query, rerank_query: str = None) -> list[MemoryUnit]:
+    def retrieve(self, query, rerank_query: str = None, final_k: int = None) -> list[MemoryUnit]:
         """检索。query 可以是单个字符串，也可以是多个子查询的列表（查询扩展）。
         多查询时，每条记忆取它在各子查询上的最高分（union 语义），再做分层选择。
         rerank_query：用于精排的查询（默认取 query 的第一个，通常是原始问题）。
-        流程：宽召回（分层 top_k×2）→ cross-encoder 精排 → 取 final_k（窄，提升信噪比）。"""
+        final_k：覆盖默认 final_k（列举题可临时调大，召更多同类项）。
+        流程：三路召回 → 合并去重 → cross-encoder 精排 → MMR 多样性选择 → 取 final_k。
+        三路召回：
+          1. 向量相似度召回（observation 层）
+          2. 向量相似度召回（summary 层）
+          3. BM25 关键词召回（独立路径，不分层）"""
         if len(self.store) == 0:
             return []
+        fk = final_k or self.final_k
         queries = [query] if isinstance(query, str) else list(query)
+        units = self.store.units
+        
         # 多查询逐元素取 max：任一子查询命中即算相关，适合"列举型"问题召全
         scores = np.max(np.stack([self._score(q) for q in queries]), axis=0)
-        units = self.store.units
+        
+        # BM25 独立召回
+        bm25_candidates = []
+        if self.bm25_as_separate_recall and self.strategy == "hybrid":
+            # 对每个查询单独做 BM25 召回，取 top_k
+            bm25 = self._get_bm25()
+            bm25_scores_list = []
+            for q in queries:
+                bm25_scores = bm25.scores(q)
+                bm25_scores_list.append(bm25_scores)
+            bm25_scores = np.max(np.stack(bm25_scores_list), axis=0)
+            # BM25 单独取 top_k
+            bm25_idx = list(np.argsort(-bm25_scores)[:self.top_k])
+            bm25_candidates = bm25_idx
 
         if not self.per_layer:
             # 全局竞争：直接取 top_k（旧行为，留作消融对照）
@@ -169,25 +205,36 @@ class MemoryRetriever:
                 kind_idx = np.array(kind_idx)
                 order = kind_idx[np.argsort(-scores[kind_idx])]
                 picked.extend(order[:self.top_k].tolist())
+            # 合并 BM25 召回结果
+            picked.extend(bm25_candidates)
             # 合并后按全局分数从高到低排序，作为最终顺序
             idx = sorted(set(picked), key=lambda i: -scores[i])
 
-        hits = [units[i] for i in idx]
+        cand_idx = idx                       # 宽召回候选（全局下标）
+        hits = [units[i] for i in cand_idx]
+        rel = None                           # 候选的相关性分数（精排分优先，否则召回分）
         reranked = False
 
-        # 精排：用 cross-encoder 对宽召回结果按原始问题重排，取 final_k（窄生成）
-        if self.rerank and len(hits) > self.final_k:
+        # 精排：用 cross-encoder 对宽召回结果按原始问题重排（产出相关性分数）
+        if self.rerank and len(hits) > fk:
             rk = _Reranker.get()
             if rk is not None:
                 rq = rerank_query or queries[0]
                 rscores = rk.rank(rq, [h.text for h in hits])
-                order = np.argsort(-rscores)[:self.final_k]
-                hits = [hits[i] for i in order]
+                order = np.argsort(-rscores)
+                cand_idx = [cand_idx[i] for i in order]
+                hits = [units[i] for i in cand_idx]
+                rel = _minmax(np.asarray(rscores)[order])
                 reranked = True
-        if not reranked:
-            # 未精排（关闭或模型不可用）：仍按召回分数截断到 final_k，
-            # 使精排消融只隔离"是否精排"这一个变量（两组上下文条数一致）。
-            hits = hits[:self.final_k]
+        if rel is None:
+            # 未精排：用召回分数作为相关性，并按其排序候选
+            rel = _minmax(scores[np.array(cand_idx)]) if cand_idx else np.zeros(0)
+
+        # MMR 多样性选择：λ·相关性 -(1-λ)·与已选项的最大相似度，打散同质冗余
+        if self.mmr and len(hits) > fk:
+            hits = self._mmr_select(cand_idx, rel, fk)
+        else:
+            hits = hits[:fk]
 
         if self.verbose:
             kinds = {}
@@ -195,8 +242,35 @@ class MemoryRetriever:
                 kinds[h.kind] = kinds.get(h.kind, 0) + 1
             mode = f"per_layer top{self.top_k}" if self.per_layer else f"global top{self.top_k}"
             print(f"[Retriever] strategy={self.strategy} {mode} nq={len(queries)} "
-                  f"rerank={'on' if reranked else 'off'} -> 最终 {len(hits)} 条 ({kinds})")
+                  f"rerank={'on' if reranked else 'off'} mmr={'on' if self.mmr else 'off'} "
+                  f"-> 最终 {len(hits)} 条 ({kinds})")
         return hits
+
+    def _mmr_select(self, cand_idx, rel, k: int) -> list[MemoryUnit]:
+        """Maximal Marginal Relevance：在候选里贪心选 k 条，
+        每步选 λ·相关性 -(1-λ)·与已选项的最大向量相似度 最大的那条。
+        相关性 rel 与 cand_idx 同序（已按相关性降序）。"""
+        units = self.store.units
+        mat = self.store._matrix                       # (N, dim) 归一化向量
+        cand = list(cand_idx)
+        # 候选两两相似度（归一化向量点积即余弦）
+        sub = mat[np.array(cand)]                      # (C, dim)
+        sim = sub @ sub.T                              # (C, C)
+        selected, remaining = [], list(range(len(cand)))
+        while remaining and len(selected) < k:
+            if not selected:
+                pick = remaining[0]                    # 相关性最高的先入选
+            else:
+                best, best_pos = -1e9, remaining[0]
+                for j in remaining:
+                    redundancy = float(np.max(sim[j, selected]))
+                    mmr = self.mmr_lambda * float(rel[j]) - (1 - self.mmr_lambda) * redundancy
+                    if mmr > best:
+                        best, best_pos = mmr, j
+                pick = best_pos
+            selected.append(pick)
+            remaining.remove(pick)
+        return [units[cand[j]] for j in selected]
 
     def _recency(self) -> np.ndarray:
         units = self.store.units

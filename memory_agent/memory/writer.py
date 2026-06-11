@@ -16,7 +16,7 @@ import json
 import re
 from concurrent.futures import ThreadPoolExecutor
 
-from memory.store import MemoryUnit, parse_date
+from memory.store import MemoryUnit, parse_date, annotate_relative_dates
 
 
 # 高层记忆抽取 prompt：对标主流 agent 的「事实 + 反思」型高层记忆。
@@ -26,11 +26,13 @@ Extract:
 - Key facts about each person (identity, job, relationships, location, health, preferences).
 - Events with their dates/times, plans, decisions, and changes/updates to earlier facts.
 - One or two short reflections (higher-level takeaways) if warranted.
+- EXHAUSTIVE LIST ITEMS: When a speaker mentions multiple items, activities, books, places, or any enumerated list, extract ALL items as separate memories OR keep them together in ONE memory - do NOT omit any items.
 
 Rules:
 - Each memory is ONE self-contained sentence; resolve pronouns to names.
 - PRESERVE SPECIFIC DETAILS verbatim: proper nouns (book/movie/place/brand/car/song names), numbers, quantities, and list items. Do NOT generalize them away — e.g. write "Tim read Game of Thrones, The Hobbit, and The Alchemist", NOT "Tim read some fantasy books". If a turn enumerates several items, keep ALL of them in the memory.
 - IMPORTANT: convert every relative time expression into an ABSOLUTE date, computed from the session date given below. e.g. if the session date is 12 July 2023, then "two days ago" -> "on 10 July 2023", "last Friday" -> the actual date of that Friday, "yesterday" -> 11 July 2023, "next month" -> the corresponding month. Write the absolute date directly in the sentence. If a time expression is too vague to pin down (e.g. "a few years ago"), keep it as stated.
+- For questions about "what activities", "what books", "what places", extract ALL mentioned items, not just some.
 - Skip greetings and pure small talk.
 - Rate importance 1-10 (10 = core identity / major life event).
 
@@ -57,6 +59,9 @@ class MemoryWriter:
                 text = (t.get("text") or "").strip()
                 if not text:
                     continue
+                # D：确定性地把相对时间（"last Friday" 等）就地标注成绝对日期，
+                # 让无 LLM 的 observation 层也带上精确时间，供时间题精排/生成使用。
+                text = annotate_relative_dates(text, ts)
                 # 带上说话人和日期，让这条观察记忆自包含
                 units.append(MemoryUnit(
                     mem_id=-1, text=f"{t['speaker']} ({sess['date_time']}): {text}",
@@ -107,6 +112,13 @@ class MemoryWriter:
             print(f"[Writer] summary 层：{len(summaries)} 条高层记忆 "
                   f"（{len(sessions)} 次 LLM 调用，并发）")
         return summaries
+
+    def merge_cross_session_memories(self, memories: list[MemoryUnit]) -> list[MemoryUnit]:
+        """[已停用] 早期版本用关键词把"同主题"记忆拼成一条，但实测它把无关事实
+        拼成乱句（如 "Audrey has four dogs..., and two Chihuahua mixes"），既损召回又
+        污染生成上下文。近重复合并交给 updater 的 embedding dedup 即可，这里直接透传。
+        保留方法签名以兼容 controller 调用与历史消融。"""
+        return memories
 
 
 def _clamp_importance(v) -> float:

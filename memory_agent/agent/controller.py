@@ -33,9 +33,47 @@ from memory.retriever import MemoryRetriever                 # noqa: E402
 from memory.updater import MemoryUpdater                     # noqa: E402
 
 
-ANSWER_PROMPT = """You are an assistant answering a question about two people's past conversations. Use ONLY the retrieved memories below. Each memory is tagged with its date. Keep the answer short (a phrase or one sentence). For "when" questions, answer with the specific date. For questions that ask to list or enumerate (e.g. "what books / which places"), gather EVERY matching item across all memories. If the memories do not contain the answer, reply 'unknown'.
+ANSWER_PROMPT = """Answer a question about two people's past conversations based ONLY on the retrieved memories.
 
-=== Retrieved memories ===
+Guidelines:
+1. Direct facts: If a memory directly states the answer, quote or state that fact.
+2. One-step inference: If the answer is implied, infer the answer (e.g., "went surfing" implies "likes surfing").
+3. Multi-hop reasoning: If the answer requires combining information from multiple memories, do so:
+   - Memory A: "X recommended a book to Y"
+   - Memory B: "X's favorite book is Z"
+   - Conclusion: Y read book Z
+4. Lists: For "what" questions, extract ALL matching items from ALL memories, not just the first match.
+5. Hypothetical questions ("would", "likely"): Infer from preferences and past behavior with a brief reason.
+6. When questions: Extract the date/time as stated in the memory.
+
+Rule: Answer "unknown" ONLY when no memory contains or implies the answer. A reasoned inference beats "unknown".
+
+Answer format: Short phrase or sentence. No preamble.
+
+=== Memories ===
+{memories}
+
+=== Question ===
+{question}
+
+=== Answer ==="""
+
+# 时间类问题专用 prompt：精度第一。保留记忆中的时间粒度，不妄自换算。
+TEMPORAL_ANSWER_PROMPT = """Answer a TIME question about two people's past conversations. Date/time precision matters.
+
+Rules:
+1. Find the memory that describes the event, then extract its date/time.
+2. Answer with the SAME GRANULARITY as stated in the memory:
+   - If the memory says "first week of October 2023", answer "first week of October 2023" — do NOT convert to a specific day.
+   - If it says "weekend of [date]", answer with that phrasing.
+   - Keep qualifiers: "end of", "beginning of", "early", "mid", "late", etc.
+3. Use only dates present in the memories. Do not compute or infer dates not explicitly stated.
+4. If multiple dates exist, pick the one specifically tied to the event asked about.
+5. Answer "unknown" only if no memory provides any date for this event.
+
+Output only the date/time, as short as possible. No preamble.
+
+=== Memories ===
 {memories}
 
 === Question ===
@@ -44,16 +82,16 @@ ANSWER_PROMPT = """You are an assistant answering a question about two people's 
 === Answer ==="""
 
 
-# 查询扩展：仅对"列举/多部分"问题触发，把原问题拆成覆盖不同子项的查询。
-# 改进点：要求生成不同角度/不同实体的子查询，而非原问题的同义改写（同义改写只会
-# 把更多边缘相关记忆拉进候选池、稀释信噪比，对单一事实型问题有害无益）。
-QUERY_REWRITE_PROMPT = """The user's question asks for MULTIPLE items or spans several sub-topics. Break it into 2-4 focused search queries, each targeting a DIFFERENT specific item, entity, or aspect — do NOT just rephrase the whole question with synonyms. Each query is a short keyword phrase.
+# 查询扩展：对问题生成多个不同角度的检索查询，剥离问题框架，直指实体+属性。
+QUERY_EXPANSION_PROMPT = """Given a question about two people's chat history, generate 2-4 short keyword search queries to find the answer memory.
 
-Example:
-Question: "What schools did John play basketball in and how many years was he on the high school team?"
-Queries: ["John middle school basketball", "John high school basketball team", "John college basketball", "John years on high school team"]
-
-Return ONLY a JSON array of strings.
+Rules:
+- Remove question words and negations ("besides", "other than", "what", "which", "how", "did", "does").
+- Search for the entity/attribute being asked about, not the question framing.
+- For exclusion questions (e.g., "what X besides Y"), target X (not Y).
+- For list questions, target different items per query.
+- For time questions, include the event and relevant time keywords.
+- Each query: 2-5 words. Return ONLY a JSON array of strings.
 
 Question: {question}
 Queries:"""
@@ -65,10 +103,14 @@ class MemoryAgent:
     DEFAULT_CONFIG = {
         "retrieval_strategy": "hybrid",   # vector | three_factor | hybrid
         "update_mode": "dedup",            # append | dedup
-        "top_k": 8,                        # 宽召回：分层 observation/summary 各取 top_k
+        "top_k": 18,                       # 宽召回：分层 observation/summary/BM25 各取 top_k
         "rerank": True,                    # cross-encoder 精排（宽召回→窄生成）
-        "final_k": 6,                      # 精排后最终喂给生成的条数（窄，提升信噪比）
-        "query_expansion": True,           # 仅对列举/多部分问题触发（见 _should_expand）
+        "final_k": 18,                      # 精排后最终喂给生成的条数
+        "list_final_k": 12,                # 列举题临时调大，召更多同类项
+        "query_expansion": True,           # 所有问题都做多角度扩展（A.2），改善单跳/多跳召回
+        "bm25_as_separate_recall": True,   # BM25 作为独立召回路径（三路召回）
+        "mmr": False,                      # MMR 多样性选择（已关闭）
+        "mmr_lambda": 0.65,                # MMR 权衡参数
         "use_cache": True,                 # 抽取只做一次，命中缓存直接 load
         "trace": True,
     }
@@ -82,7 +124,10 @@ class MemoryAgent:
             self.store, strategy=self.cfg["retrieval_strategy"],
             top_k=self.cfg["top_k"],                       # 宽召回：分层各取 top_k
             rerank=self.cfg["rerank"],
-            final_k=self.cfg["final_k"])                   # 窄生成：精排后只留 final_k
+            final_k=self.cfg["final_k"],                   # 窄生成：精排后只留 final_k
+            bm25_as_separate_recall=self.cfg["bm25_as_separate_recall"],
+            mmr=self.cfg["mmr"],                           # MMR 多样性选择
+            mmr_lambda=self.cfg["mmr_lambda"])
         self._key = "conv"
         self._trace_path = None
 
@@ -118,6 +163,8 @@ class MemoryAgent:
             # observation 层（零 LLM）+ summary 层（并发 LLM）
             obs = writer.build_observations(conversation)
             summ = writer.build_summaries(conversation)
+            # 跨会话合并相似记忆
+            #summ = writer.merge_cross_session_memories(summ)
             updater.write_batch(obs)
             updater.write_batch(summ)
             self.store.save_cache(self._key)                  # 抽取只做一次
@@ -131,45 +178,56 @@ class MemoryAgent:
     # ---- 回答：检索 + 生成 ----
     def answer(self, question: str) -> str:
         t0 = time.time()
-        queries = self._expand_query(question)          # #2：按需查询扩展
+        is_temporal = self._is_temporal(question)
+        is_list = self._is_list(question)
+        queries = self._expand_query(question)          # A.2：所有问题都做多角度扩展
+        # 列举题临时调大 final_k，召更多同类项；其余用默认 final_k
+        fk = self.cfg["list_final_k"] if is_list else self.cfg["final_k"]
         # 精排始终用原始问题（而非可能含噪的子查询），保证信噪比
-        hits = self.retriever.retrieve(queries, rerank_query=question)
+        hits = self.retriever.retrieve(queries, rerank_query=question, final_k=fk)
         mem_block = "\n".join(f"- [{h.date_time}] ({h.kind}) {h.text}" for h in hits) \
             or "(no memories)"
-        prompt = ANSWER_PROMPT.format(memories=mem_block, question=question)
+        # D：时间题走专用 prompt（精度优先，保留粒度/限定词，不臆造日期）
+        tmpl = TEMPORAL_ANSWER_PROMPT if is_temporal else ANSWER_PROMPT
+        prompt = tmpl.format(memories=mem_block, question=question)
         self.llm_calls += 1
-        ans = self._get_llm().generate(prompt, max_tokens=64).strip()
+        ans = self._get_llm().generate(prompt, max_tokens=160).strip()
+        ans = ans.strip().rstrip(".!?").strip()
         self._log_trace(question, hits, prompt, ans, time.time() - t0, queries)
         return ans
 
     @staticmethod
-    def _should_expand(question: str) -> bool:
-        """只对'列举/多部分'问题做扩展。单一事实型（when/who/how long 等）不扩展——
-        它们只需一条精确记忆，扩大召回只会引入噪声、拖累小模型生成。"""
+    def _is_temporal(question: str) -> bool:
+        """时间类问题：when / what time / what date / how long，或显含时间词。"""
         q = question.lower().strip()
-        # 单一事实型问题的典型开头：不扩展
-        single = ("when ", "what time", "what date", "how long", "how old",
-                  "how many", "where ", "who is", "who was", "which ")
-        if q.startswith(single):
-            return False
-        # 列举/多部分信号：扩展
-        multi = (" and ", "list", "what books", "what places", "what kinds",
-                 "what types", "which ones", "all the")
-        return any(m in q for m in multi)
+        if q.startswith(("when ", "what time", "what date", "how long")):
+            return True
+        return any(w in q for w in (" what year", " which year", " on what day"))
+
+    @staticmethod
+    def _is_list(question: str) -> bool:
+        """列举/多项问题：需要召全多条同类记忆。"""
+        q = question.lower().strip()
+        signals = ("what activities", "what books", "what places", "what kinds",
+                   "what types", "what sports", "what recipes", "what writings",
+                   "what instruments", "what causes", "what tricks", "which cities",
+                   "which books", "which places", "list", "all the", "which ones",
+                   "what are", "what kind of")
+        return any(s in q for s in signals)
 
     def _expand_query(self, question: str) -> list[str]:
-        """按需把问题改写成多个子查询；不触发 / 关闭 / 解析失败时退化为原问题。"""
-        if not self.cfg["query_expansion"] or not self._should_expand(question):
+        """把问题改写成多个不同角度的子查询（A.2，对所有问题生效）；
+        关闭 / 解析失败时退化为原问题。始终保留原问题，避免改写漂移丢语义。"""
+        if not self.cfg["query_expansion"]:
             return [question]
         from memory.writer import _parse_json_array
         self.llm_calls += 1
         raw = self._get_llm().generate(
-            QUERY_REWRITE_PROMPT.format(question=question), max_tokens=120)
+            QUERY_EXPANSION_PROMPT.format(question=question), max_tokens=120)
         subs = [str(s).strip() for s in _parse_json_array(raw) if str(s).strip()]
-        # 始终保留原问题，避免改写漂移丢掉关键语义
         queries = [question] + subs[:4]
         if self.retriever.verbose:
-            print(f"[Controller] 查询扩展(列举型) -> {len(queries)} 个子查询: {subs[:4]}")
+            print(f"[Controller] 查询扩展 -> {len(queries)} 个子查询: {subs[:4]}")
         return queries
 
     # ---- 追踪日志 ----

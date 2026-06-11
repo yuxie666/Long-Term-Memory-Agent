@@ -17,19 +17,125 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import numpy as np
 
-CACHE_VERSION = "v4"  # 抽取 prompt 强化(保留专有名词/列举项)，旧缓存(v3)失效需重建
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
+CACHE_VERSION = "v5"  # observation 层加入相对日期就地标注(annotate_relative_dates)，v4 缓存失效需重建
+
+
+_WEEKDAYS = {"monday": 0, "mon": 0, "tuesday": 1, "tue": 1, "tues": 1,
+             "wednesday": 2, "wed": 2, "thursday": 3, "thu": 3, "thurs": 3,
+             "friday": 4, "fri": 4, "saturday": 5, "sat": 5, "sunday": 6, "sun": 6}
+
+
+def _fmt(d: datetime) -> str:
+    """统一成 '2 July 2023' 这种人读绝对日期（与抽取 prompt 输出风格一致）。"""
+    return f"{d.day} {d.strftime('%B')} {d.year}"
+
+
+def parse_relative_time(relative_str: str, base_date: datetime) -> Optional[datetime]:
+    """将相对时间表达式转换为绝对日期（基于会话日期 base_date）。
+    覆盖 LoCoMo 里实际出现的表达：X days/weeks/months ago、yesterday/tomorrow、
+    last/this <weekday>、last week、the <weekday> before。无法解析返回 None。"""
+    s = relative_str.lower().strip()
+
+    m = re.search(r"(\d+)\s*days?\s+ago", s)
+    if m:
+        return base_date - timedelta(days=int(m.group(1)))
+    m = re.search(r"(\d+)\s*weeks?\s+ago", s)
+    if m:
+        return base_date - timedelta(weeks=int(m.group(1)))
+    m = re.search(r"(\d+)\s*months?\s+ago", s)
+    if m:
+        return base_date - timedelta(days=int(m.group(1)) * 30)
+
+    if re.search(r"\bthe day before yesterday\b", s):
+        return base_date - timedelta(days=2)
+    if re.search(r"\byesterday\b", s):
+        return base_date - timedelta(days=1)
+    if re.search(r"\bthe day after tomorrow\b", s):
+        return base_date + timedelta(days=2)
+    if re.search(r"\btomorrow\b", s):
+        return base_date + timedelta(days=1)
+
+    # "last week" / "next week"（取对应周的同一天，作近似锚点）
+    if re.search(r"\blast week\b", s):
+        return base_date - timedelta(weeks=1)
+    if re.search(r"\bnext week\b", s):
+        return base_date + timedelta(weeks=1)
+
+    # "last Friday" / "this Friday" / "next Friday" / "the Friday before"
+    m = re.search(r"\b(last|this|next|past|coming)\s+(\w+)", s)
+    if m and m.group(2) in _WEEKDAYS:
+        kind, target = m.group(1), _WEEKDAYS[m.group(2)]
+        if kind in ("last", "past"):
+            delta = (base_date.weekday() - target) % 7 or 7
+            return base_date - timedelta(days=delta)
+        if kind in ("next", "coming"):
+            delta = (target - base_date.weekday()) % 7 or 7
+            return base_date + timedelta(days=delta)
+        # this <weekday>：本周该天（不区分前后，取最近的同周该天）
+        delta = (target - base_date.weekday()) % 7
+        return base_date + timedelta(days=delta)
+    m = re.search(r"\bthe\s+(\w+)\s+before\b", s)
+    if m and m.group(1) in _WEEKDAYS:
+        target = _WEEKDAYS[m.group(1)]
+        delta = (base_date.weekday() - target) % 7 or 7
+        return base_date - timedelta(days=delta)
+
+    return None
+
+
+# 一次性匹配文本中的相对时间短语，用于写入时就近标注绝对日期。
+_REL_PHRASE_RE = re.compile(
+    r"\b("
+    r"the day before yesterday|the day after tomorrow|yesterday|tomorrow|"
+    r"last week|next week|"
+    r"\d+\s*days?\s+ago|\d+\s*weeks?\s+ago|\d+\s*months?\s+ago|"
+    r"(?:last|this|next|past|coming)\s+(?:mon|tue|tues|wed|thu|thurs|fri|sat|sun|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+    r"the\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+before"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def annotate_relative_dates(text: str, base_date: Optional[datetime]) -> str:
+    """把文本里的相对时间短语就地标注上解析出的绝对日期，如
+    'last Friday' -> 'last Friday [= 30 June 2023]'。无法解析或无基准则原样返回。
+    这是确定性的（无 LLM），让 observation 层也带上精确日期，供时间题精排/生成使用。"""
+    if not base_date or not text:
+        return text
+
+    def repl(m: re.Match) -> str:
+        phrase = m.group(0)
+        resolved = parse_relative_time(phrase, base_date)
+        return f"{phrase} [= {_fmt(resolved)}]" if resolved else phrase
+
+    return _REL_PHRASE_RE.sub(repl, text)
 
 
 def parse_date(date_time: str) -> Optional[datetime]:
     """把 LoCoMo 的 date_time（如 "9:39 am on 15 October, 2023"）解析成 datetime。"""
     s = date_time.strip().replace(",", "")
-    for fmt in ("%I:%M %p on %d %B %Y", "%I:%M%p on %d %B %Y"):
+    # 支持更多日期格式
+    formats = [
+        "%I:%M %p on %d %B %Y",     # "9:39 am on 15 October 2023"
+        "%I:%M%p on %d %B %Y",      # "9:39am on 15 October 2023"
+        "%I:%M %p on %d %b %Y",     # "9:39 am on 15 Oct 2023"
+        "%B %d, %Y",                # "October 15, 2023"
+        "%d %B %Y",                 # "15 October 2023"
+        "%Y-%m-%d",                 # "2023-10-15"
+        "%B %Y",                    # "October 2023"
+        "%Y",                       # "2023"
+    ]
+    for fmt in formats:
         try:
             return datetime.strptime(s, fmt)
         except ValueError:
