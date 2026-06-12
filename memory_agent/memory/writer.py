@@ -31,7 +31,16 @@ Extract:
 Rules:
 - Each memory is ONE self-contained sentence; resolve pronouns to names.
 - PRESERVE SPECIFIC DETAILS verbatim: proper nouns (book/movie/place/brand/car/song names), numbers, quantities, and list items. Do NOT generalize them away — e.g. write "Tim read Game of Thrones, The Hobbit, and The Alchemist", NOT "Tim read some fantasy books". If a turn enumerates several items, keep ALL of them in the memory.
-- IMPORTANT: convert every relative time expression into an ABSOLUTE date, computed from the session date given below. e.g. if the session date is 12 July 2023, then "two days ago" -> "on 10 July 2023", "last Friday" -> the actual date of that Friday, "yesterday" -> 11 July 2023, "next month" -> the corresponding month. Write the absolute date directly in the sentence. If a time expression is too vague to pin down (e.g. "a few years ago"), keep it as stated.
+- CRITICAL TIME NORMALIZATION: Convert EVERY relative time expression to an ABSOLUTE date using the session date below:
+  * "two days ago" → compute exact date (e.g., if session is 12 July 2023, write "on 10 July 2023")
+  * "last Friday" → compute the actual Friday date before the session
+  * "yesterday" → the day before session date
+  * "next month" → the specific month name and year
+  * "the weekend of X" → compute the actual weekend dates (e.g., "weekend of 22-23 July 2023")
+  * "a few days before X" → compute the approximate date range
+  * "the week before X" → compute the actual week dates
+  * If a time expression is genuinely vague (e.g., "a few years ago", "sometime in 2022"), keep it as stated but add any available context.
+  * ALWAYS show your computation: write "[= computed date]" after the original expression for clarity.
 - For questions about "what activities", "what books", "what places", extract ALL mentioned items, not just some.
 - Skip greetings and pure small talk.
 - Rate importance 1-10 (10 = core identity / major life event).
