@@ -108,7 +108,8 @@ class MemoryRetriever:
                  per_layer: bool = True, bm25_weight: float = 0.8,
                  rerank: bool = True, final_k: int = 6,
                  mmr: bool = True, mmr_lambda: float = 0.65, verbose: bool = True,
-                 bm25_as_separate_recall: bool = True):
+                 bm25_as_separate_recall: bool = True,
+                 min_observation_final: int = 0, max_summary_final: int | None = None):
         assert strategy in ("vector", "three_factor", "hybrid")
         self.store = store
         self.strategy = strategy
@@ -126,6 +127,8 @@ class MemoryRetriever:
         self.tf = tf_weights                            # three_factor 三因子权重
         self.bm25_weight = bm25_weight                  # hybrid 下 BM25 关键词分的融合权重
         self.bm25_as_separate_recall = bm25_as_separate_recall  # 是否将 BM25 作为独立召回路
+        self.min_observation_final = min_observation_final
+        self.max_summary_final = max_summary_final
         self.verbose = verbose
         self._bm25 = None
         self._bm25_n = -1                               # 构建时的库大小，用于失效判断
@@ -143,8 +146,10 @@ class MemoryRetriever:
         if self.strategy == "vector":
             return sims
         recency = self._recency()
-        importance = _minmax(np.array([u.importance for u in self.store.units]))
+        raw_importance = np.array([u.importance for u in self.store.units], dtype=np.float32)
+        importance = _minmax(raw_importance)
         if self.strategy == "three_factor":
+            importance = np.clip(raw_importance, 1.0, 10.0) / 10.0
             return (self.tf[0] * _minmax(sims)
                     + self.tf[1] * recency + self.tf[2] * importance)
         # hybrid：向量相关性 + 三因子小幅加成。
@@ -234,7 +239,7 @@ class MemoryRetriever:
         if self.mmr and len(hits) > fk:
             hits = self._mmr_select(cand_idx, rel, fk)
         else:
-            hits = hits[:fk]
+            hits = self._select_with_layer_quota(hits, fk)
 
         if self.verbose:
             kinds = {}
@@ -245,6 +250,58 @@ class MemoryRetriever:
                   f"rerank={'on' if reranked else 'off'} mmr={'on' if self.mmr else 'off'} "
                   f"-> 最终 {len(hits)} 条 ({kinds})")
         return hits
+
+    def _select_with_layer_quota(self, hits: list[MemoryUnit], k: int) -> list[MemoryUnit]:
+        """Keep score order but reserve room for detailed observation memories."""
+        if k <= 0 or not hits:
+            return []
+        if self.min_observation_final <= 0 and self.max_summary_final is None:
+            return hits[:k]
+
+        selected = []
+        selected_ids = set()
+        summary_count = 0
+        max_summary = self.max_summary_final if self.max_summary_final is not None else k
+
+        for h in hits:
+            if h.kind == "summary" and summary_count >= max_summary:
+                continue
+            selected.append(h)
+            selected_ids.add(id(h))
+            if h.kind == "summary":
+                summary_count += 1
+            if len(selected) >= k:
+                break
+
+        if len(selected) < k:
+            for h in hits:
+                if id(h) in selected_ids:
+                    continue
+                selected.append(h)
+                selected_ids.add(id(h))
+                if len(selected) >= k:
+                    break
+
+        need_obs = min(self.min_observation_final, k)
+        obs_count = sum(1 for h in selected if h.kind == "observation")
+        if obs_count < need_obs:
+            extras = [h for h in hits if h.kind == "observation" and id(h) not in selected_ids]
+            for obs in extras:
+                replace_at = None
+                for i in range(len(selected) - 1, -1, -1):
+                    if selected[i].kind == "summary":
+                        replace_at = i
+                        break
+                if replace_at is None:
+                    break
+                selected_ids.discard(id(selected[replace_at]))
+                selected[replace_at] = obs
+                selected_ids.add(id(obs))
+                obs_count += 1
+                if obs_count >= need_obs:
+                    break
+
+        return selected[:k]
 
     def _mmr_select(self, cand_idx, rel, k: int) -> list[MemoryUnit]:
         """Maximal Marginal Relevance：在候选里贪心选 k 条，

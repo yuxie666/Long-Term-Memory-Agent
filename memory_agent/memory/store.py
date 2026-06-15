@@ -26,7 +26,7 @@ import numpy as np
 
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
-CACHE_VERSION = "v5"  # observation 层加入相对日期就地标注(annotate_relative_dates)，v4 缓存失效需重建
+CACHE_VERSION = "v6"  # observation importance heuristic changed; v5 cache must be rebuilt
 
 
 _WEEKDAYS = {"monday": 0, "mon": 0, "tuesday": 1, "tue": 1, "tues": 1,

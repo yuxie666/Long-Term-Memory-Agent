@@ -76,7 +76,8 @@ class MemoryWriter:
                     mem_id=-1, text=f"{t['speaker']} ({sess['date_time']}): {text}",
                     kind="observation", speaker=t["speaker"],
                     session_id=sess["session_id"], date_time=sess["date_time"],
-                    importance=1.0, timestamp=ts, source_dia_ids=[t["dia_id"]],
+                    importance=_observation_importance(text),
+                    timestamp=ts, source_dia_ids=[t["dia_id"]],
                 ))
         if self.verbose:
             print(f"[Writer] observation 层：{len(units)} 条细粒度记忆（无 LLM 调用）")
@@ -135,6 +136,80 @@ def _clamp_importance(v) -> float:
         return float(max(1, min(10, int(v))))
     except (ValueError, TypeError):
         return 5.0
+
+
+def _observation_importance(text: str) -> float:
+    """Heuristic 1-10 importance for raw observation turns without extra LLM calls."""
+    if not text:
+        return 1.0
+
+    raw = text.strip()
+    low = raw.lower()
+    words = re.findall(r"[a-z0-9']+", low)
+    score = 2.0
+
+    smalltalk = (
+        "hi", "hello", "hey", "how are you", "how's it going", "thanks",
+        "thank you", "nice", "cool", "awesome", "great to hear", "sounds good",
+    )
+    if len(words) <= 8 and any(p in low for p in smalltalk):
+        score = 1.0
+
+    time_patterns = (
+        r"\b\d{1,2}\s+\w+\s+\d{4}\b",
+        r"\b\d{4}\b",
+        r"\b(yesterday|tomorrow|last|next|ago|week|month|year|today)\b",
+        r"\[=\s*\d{1,2}\s+\w+\s+\d{4}\]",
+    )
+    if any(re.search(p, raw, re.IGNORECASE) for p in time_patterns):
+        score += 2.0
+
+    if re.search(r"\b\d+\b", raw):
+        score += 1.0
+    if re.search(r'"[^"]+"|\'[^\']+\'', raw):
+        score += 1.0
+    proper = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", raw)
+    if len(proper) >= 2:
+        score += 1.0
+
+    preference_terms = (
+        "like", "love", "enjoy", "favorite", "prefer", "hobby", "passion",
+        "interested", "into ", "fan of", "dislike", "hate",
+    )
+    if any(t in low for t in preference_terms):
+        score += 1.5
+
+    profile_terms = (
+        "job", "work", "career", "school", "college", "university", "family",
+        "mother", "father", "sister", "brother", "partner", "wife", "husband",
+        "friend", "dog", "cat", "pet", "live", "moved", "home", "health",
+        "doctor", "hospital", "diagnosed", "therapy",
+    )
+    if any(t in low for t in profile_terms):
+        score += 1.5
+
+    event_terms = (
+        "went", "visited", "traveled", "bought", "adopted", "started",
+        "finished", "won", "lost", "failed", "passed", "met", "joined",
+        "decided", "planning", "plan to", "will", "going to", "recently",
+    )
+    if any(t in low for t in event_terms):
+        score += 1.5
+
+    if "," in raw or " and " in low:
+        score += 0.5
+
+    major_terms = (
+        "married", "divorced", "pregnant", "graduated", "promotion",
+        "accident", "surgery", "death", "breakup", "engaged", "military",
+        "award", "competition", "contest",
+    )
+    if any(t in low for t in major_terms):
+        score += 2.0
+
+    if len(words) <= 5 and score <= 3.0:
+        score = min(score, 2.0)
+    return float(max(1.0, min(10.0, round(score, 1))))
 
 
 def _parse_json_array(raw: str) -> list:

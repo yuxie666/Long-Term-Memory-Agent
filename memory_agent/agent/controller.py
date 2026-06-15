@@ -125,6 +125,10 @@ class MemoryAgent:
         "retrieval_strategy": "hybrid",   # vector | three_factor | hybrid
         "update_mode": "dedup",            # append | dedup
         "top_k": 18,                       # 宽召回：分层 observation/summary/BM25 各取 top_k
+        "recency_half_life_days": 60.0,
+        "tf_weights": (1.0, 1.0, 1.0),
+        "min_observation_final": 0,
+        "max_summary_final": None,
         "rerank": True,                    # cross-encoder 精排（宽召回→窄生成）
         "final_k": 18,                      # 精排后最终喂给生成的条数
         "list_final_k": 20,                # 列举题调大，召更多同类项（从12增加到20）
@@ -146,7 +150,11 @@ class MemoryAgent:
             top_k=self.cfg["top_k"],                       # 宽召回：分层各取 top_k
             rerank=self.cfg["rerank"],
             final_k=self.cfg["final_k"],                   # 窄生成：精排后只留 final_k
+            recency_half_life_days=self.cfg["recency_half_life_days"],
+            tf_weights=self.cfg["tf_weights"],
             bm25_as_separate_recall=self.cfg["bm25_as_separate_recall"],
+            min_observation_final=self.cfg["min_observation_final"],
+            max_summary_final=self.cfg["max_summary_final"],
             mmr=self.cfg["mmr"],                           # MMR 多样性选择
             mmr_lambda=self.cfg["mmr_lambda"])
         self._key = "conv"
@@ -430,7 +438,16 @@ class AblA_VectorAgent(MemoryAgent):
 class AblA_ThreeFactorAgent(MemoryAgent):
     """A-2：只用三因子打分。"""
     def __init__(self):
-        super().__init__({"retrieval_strategy": "three_factor", "update_mode": "dedup"})
+        super().__init__({
+            "retrieval_strategy": "three_factor",
+            "update_mode": "dedup",
+            "query_expansion": False,
+            "rerank": False,
+            "tf_weights": (2.0, 0.2, 0.8),
+            "recency_half_life_days": 180.0,
+            "min_observation_final": 12,
+            "max_summary_final": 6,
+        })
 
 
 class AblA_HybridAgent(MemoryAgent):
